@@ -91,17 +91,27 @@ Unregistered clients connect as guests and may only `register`, `quit`, or
 - **Persistence.** Accounts, info text, and block lists serialize to
   `users.json` on every change and reload at startup. Rooms and presence are
   intentionally runtime-only.
+- **Hashed credentials.** Passwords are salted and hashed with scrypt. The
+  derivation is deliberately slow, so it runs outside the lock — a login
+  never stalls other clients.
 
 Full design notes — data structures, concurrency rules, per-function
 responsibilities — are in [`docs/DESIGN.md`](docs/DESIGN.md).
 
-## Known limitations
+## Security notes
 
-Passwords are stored in plaintext in `users.json`. That was the original
-assignment's specification and is kept here so the implementation matches its
-documented behavior; a production version would store a salted hash
-(`hashlib.scrypt` in the standard library). The protocol is also unencrypted
-plaintext over TCP, since it was designed to be Telnet-compatible.
+Passwords are stored as salted **scrypt** hashes (`hashlib.scrypt`, standard
+library — no dependency added), in the form
+`scrypt$<n>$<r>$<p>$<salt>$<hash>`. Storing the cost parameters alongside each
+hash means they can be raised later without invalidating existing accounts.
+Verification is a constant-time compare, and a `users.json` written by the
+original coursework version — which stored plaintext — is migrated to a hash
+automatically on the owner's next successful login.
+
+The transport itself is unencrypted plaintext over TCP, since the protocol was
+designed to be Telnet-compatible: passwords are hashed at rest but not in
+transit. Running it across an untrusted network would want TLS
+(`ssl.wrap_socket` around the listening socket) or an SSH tunnel.
 
 ## Project layout
 

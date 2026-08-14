@@ -19,7 +19,7 @@ raw TCP client — the bundled `client.py`, `telnet`, or `nc`.
 
 | Structure | Purpose |
 | --- | --- |
-| `registered_users` | Persistent accounts. Key: username. Value: `password`, `info`, `blocked` (set of usernames). Loaded from and saved to `users.json`. |
+| `registered_users` | Persistent accounts. Key: username. Value: `password` (salted scrypt hash), `info`, `blocked` (set of usernames). Loaded from and saved to `users.json`. |
 | `online_users` | Runtime state for connected clients. Key: handle. Value: `sock`, `is_registered`, `rooms` (set of room IDs), `cmd_count`, `actual_name`, `info`, `blocked`. |
 | `rooms` | Active rooms. Key: room ID (int). Value: `topic`, `leader`, `members` (set of handles). |
 | `next_room_id` | Auto-incrementing counter for unique room IDs. |
@@ -116,10 +116,37 @@ specific messages (`Room does not exist`, `Incorrect command format`,
 cannot take down the process, and decode client bytes with `errors='replace'`
 so malformed input cannot raise. Empty receives are treated as disconnects.
 
+## Credential storage
+
+Passwords are salted and hashed with scrypt (`hashlib.scrypt`, standard
+library) rather than stored as the plaintext the original assignment
+specified. Each record holds the parameters used:
+
+```
+scrypt$<n>$<r>$<p>$<salt_hex>$<hash_hex>
+```
+
+Defaults are n=16384, r=8, p=1, producing a 32-byte key in roughly 40 ms and
+about 16 MiB of working memory — slow enough to make offline guessing
+expensive, fast enough for an interactive login. Encoding the parameters per
+record means the cost can be raised later without invalidating accounts
+hashed under the old settings, since verification reads the parameters back
+out of the stored value.
+
+`verify_password()` compares with `hmac.compare_digest()` so a wrong guess
+cannot be narrowed down by timing, and fails closed on a malformed record. It
+also accepts a legacy plaintext record once and returns a replacement hash,
+which the login path persists — so a `users.json` from the pre-hashing
+version keeps working without anyone re-registering.
+
+Both hashing and verification run outside the lock. The whole point of scrypt
+is that it is slow, so holding the global lock across a derivation would
+serialize every login against the rest of the server.
+
 ## Known limitations
 
-Passwords are stored in plaintext in `users.json`, which is what the original
-assignment specified. Production would use a salted hash — `hashlib.scrypt`
-covers this in the standard library. There is no transport encryption; the
-protocol is plaintext over TCP by design, since the assignment targeted
-Telnet clients.
+There is no transport encryption: the protocol is plaintext over TCP by
+design, since the assignment targeted Telnet clients. Passwords are therefore
+protected at rest but not in transit, and running this across an untrusted
+network would want the listening socket wrapped in TLS via `ssl`, or an SSH
+tunnel in front of it.
