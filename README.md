@@ -1,13 +1,13 @@
 # Multi-Threaded TCP Chat Server
 
-A concurrent chat server built on raw TCP sockets in pure Python — no
+A concurrent chat server built on raw TCP sockets in pure Python. No
 frameworks, no dependencies. Handles many simultaneous clients with a thread
 per connection, supports persistent user accounts, private messaging, user
 blocking, and dynamic chat rooms.
 
 ## Quickstart
 
-Requires Python 3.8+. Nothing to install.
+Requires Python 3.8+.
 
 ```bash
 git clone https://github.com/Jordan-Forthman/Multi-Threaded-TCP-Chat-Server.git
@@ -80,7 +80,7 @@ Unregistered clients connect as guests and may only `register`, `quit`, or
 - **Thread per client.** The accept loop spawns a daemon `threading.Thread`
   per connection, so a slow or idle client never blocks the others.
 - **One lock over shared state.** A `threading.RLock` guards online users,
-  rooms, and accounts. The lock is never held across a blocking socket read —
+  rooms, and accounts. The lock is never held across a blocking socket read,
   otherwise one client sitting at a password prompt would stall the server.
 - **Reliable writes.** All output goes through a `sendall`-style helper that
   loops until the buffer drains, since a single `send()` may transmit only
@@ -92,40 +92,5 @@ Unregistered clients connect as guests and may only `register`, `quit`, or
   `users.json` on every change and reload at startup. Rooms and presence are
   intentionally runtime-only.
 - **Hashed credentials.** Passwords are salted and hashed with scrypt. The
-  derivation is deliberately slow, so it runs outside the lock — a login
+  derivation is deliberately slow, so it runs outside the lock: a login
   never stalls other clients.
-
-Full design notes — data structures, concurrency rules, per-function
-responsibilities — are in [`docs/DESIGN.md`](docs/DESIGN.md).
-
-## Security notes
-
-Passwords are stored as salted **scrypt** hashes (`hashlib.scrypt`, standard
-library — no dependency added), in the form
-`scrypt$<n>$<r>$<p>$<salt>$<hash>`. Storing the cost parameters alongside each
-hash means they can be raised later without invalidating existing accounts.
-Verification is a constant-time compare, and a `users.json` written by the
-original coursework version — which stored plaintext — is migrated to a hash
-automatically on the owner's next successful login.
-
-The transport itself is unencrypted plaintext over TCP, since the protocol was
-designed to be Telnet-compatible: passwords are hashed at rest but not in
-transit. Running it across an untrusted network would want TLS
-(`ssl.wrap_socket` around the listening socket) or an SSH tunnel.
-
-## Project layout
-
-```
-server.py        chat server
-client.py        client, so no telnet install is needed
-prelogin.txt     login banner
-goodbye.txt      logout message
-docs/DESIGN.md   architecture and design notes
-```
-
-## Background
-
-Originally built as a systems programming assignment (COP4521) exploring
-socket programming and concurrency, then cleaned up to run anywhere: the
-coursework version bound to the university host's `gethostname()` and assumed
-a shared lab machine, so it would not start on a personal computer.
