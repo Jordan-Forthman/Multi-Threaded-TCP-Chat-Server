@@ -1,40 +1,29 @@
-"""
-Name: Jordan Forthman
-Date: 11/4/25
-Assignment: 4
-Due Date: 11/4/25
+"""Multi-threaded TCP chat server.
 
-About this project: This project implements a multi-threaded internet chat server that supports user registration,
-private messaging, room-based discussions, and message broadcasting with blocking functionality. It closely replicates the
-behavior and output formatting of the FSU linprog chat server while ensuring thread-safe operations and persistent user data.
+Serves a line-oriented chat protocol over raw TCP sockets. Each client is
+handled on its own thread; all shared state (online users, rooms, accounts)
+is guarded by a single reentrant lock. Registered accounts persist to JSON
+between restarts.
 
-Assumptions: The server runs on a single machine and communicates with clients via plain Telnet over TCP.
-Usernames and room topics contain no special characters that would interfere with command parsing.
-The users.json file is accessible and writable in the servers working directory for persistence.
-
-Testing Results:
-register: pass
-who: pass
-status, info: pass
-start, rooms, join, leave: pass
-say: pass
-shout: pass
-tell: pass
-block, unblock: pass
-help, quit, exit: pass
-error handling/feedbacks: pass
-overall: pass
+Run `python3 server.py --help` for options, or connect with the bundled
+client: `python3 client.py`.
 """
 
-from socket import *  
-import sys
+from socket import *
+import argparse
 import threading
 import json
 import os
 
-# Define file paths for pre-login and goodbye messages
-GOODBYEMSGFILE = "./goodbye.txt"
-BEFORELOGINMSGFILE = "./prelogin.txt"
+# Resolve data files relative to this file so the server can be started from
+# any working directory.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+GOODBYEMSGFILE = os.path.join(BASE_DIR, "goodbye.txt")
+BEFORELOGINMSGFILE = os.path.join(BASE_DIR, "prelogin.txt")
+USERSFILE = os.path.join(BASE_DIR, "users.json")
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 4521
 
 # Global variables to store the content of the message files
 beforeLoginMsg = ''
@@ -82,45 +71,78 @@ def loadMsgs():
         beforeLoginMsg = f.read()
     with open(GOODBYEMSGFILE, "r") as f:
         goodbyeMsg = f.read()
-                
-# Check if the correct number of command-line arguments is provided
-n = len(sys.argv)
-if (n != 2):
-    print("Usage: server_port")
-    exit()
 
-loadMsgs()
+lock = threading.RLock()  # Lock for thread-safe operations on shared data structures
 
-lock = threading.RLock()
 registered_users = {}  # Dictionary to store registered users data (password, info, blocked users)
-online_users = {}      # Dictionary to store currently online users data (socket, rooms, etc.)
+online_users = {}      # Dictionary to store currently online users' data (socket, rooms, etc.)
 rooms = {}             # Dictionary to store active chat rooms (topic, leader, members)
 next_room_id = 0       # Counter for generating unique room IDs
+next_guest_id = 1      # Counter for generating unique handles for anonymous clients
 
 # -------------------------------------------Persistence functions---------------------------------------------
 
 # Load registered users from JSON file (if it exists).
-if os.path.exists('users.json'):
-    with open('users.json', 'r') as f:
+def load_users():
+    if not os.path.exists(USERSFILE):
+        return
+    with open(USERSFILE, 'r') as f:
         data = json.load(f)
+    with lock:
         for u, d in data.items():
             registered_users[u] = {
                 'password': d['password'],
                 'info': d['info'],
-                'blocked': set(d['blocked'])
+                'blocked': set(d['blocked'])  # set for efficient lookups
             }
 
 # Save registered users data to a JSON file.
 def save_users():
     with lock:  # Ensure thread-safe saving
         # Convert sets (like blocked users) to lists for JSON compatibility
-        data = {u: {'password': d['password'], 'info': d['info'], 'blocked': list(d['blocked'])} 
+        data = {u: {'password': d['password'], 'info': d['info'], 'blocked': list(d['blocked'])}
                 for u, d in registered_users.items()}
         # Serialize the registered_users dictionary to 'users.json'.
-        with open('users.json', 'w') as f:
+        with open(USERSFILE, 'w') as f:
             json.dump(data, f)
 
 # --------------------------------------------Persistence Functions End----------------------------------------------
+
+class LineReader:
+    """Buffers a socket's byte stream and hands back one complete line at a time.
+
+    TCP is a stream, not a sequence of messages: a single recv() may return
+    several commands at once (a scripted client sending fast) or only part of
+    one. Reading a line per recv() therefore mangles input from anything but a
+    human typing. This buffers instead, so framing is correct either way.
+    """
+
+    def __init__(self, sock, maxline=4096):
+        self.sock = sock
+        self.buf = b""
+        self.maxline = maxline
+
+    def readline(self):
+        """Next line without its terminator, or None once the peer is done."""
+        while b"\n" not in self.buf:
+            try:
+                chunk = self.sock.recv(1000)
+            except OSError:
+                return None
+            if not chunk:
+                # Peer closed; surrender any unterminated trailing data once.
+                if self.buf:
+                    line, self.buf = self.buf, b""
+                    return line
+                return None
+            self.buf += chunk
+            if len(self.buf) > self.maxline:
+                # Don't let a client without newlines grow the buffer forever.
+                line, self.buf = self.buf, b""
+                return line
+        line, _, self.buf = self.buf.partition(b"\n")
+        return line
+
 
 """
 Send all data to sock, return 1 if successful
@@ -177,7 +199,7 @@ def processCmd(userName, sock, cmd):
     actual_name = user_data['actual_name']
     is_registered = user_data['is_registered']
 
-    # Guest Mode Restrictions
+    # --- GUEST MODE RESTRICTION ---
     if not is_registered and command not in ['register', 'quit', 'exit']:
         mySendAll(sock, b"Unsupported command\n")
         return 0
@@ -309,7 +331,7 @@ def processCmd(userName, sock, cmd):
         message = ' '.join(tmp[1:])
         with lock:
             for u, udata in list(online_users.items()):
-                if u == userName:  # Skip self
+                if u == userName:  # Skip self for now; echo separately
                     continue
                 if actual_name in udata['blocked']:  # Respect blocks
                     mySendAll(udata['sock'], f"You have been blocked by {actual_name}\n".encode())
@@ -343,7 +365,7 @@ def processCmd(userName, sock, cmd):
 
     elif command == 'info':  # Set or show user info
         with lock: 
-            if len(tmp) == 1:  # No args defaults to self
+            if len(tmp) == 1:  # No args
                 info = online_users[userName]['info']
                 msg = f"Info: {info}\n" if info else "Info: -\n"
                 mySendAll(sock, msg.encode())
@@ -450,42 +472,62 @@ def handleOneClient(sock):
     mySendAll(sock, beforeLoginMsg.encode())
     mySendAll(sock, "Enter your username: ".encode())
 
+    reader = LineReader(sock)
+
     # Check if any data received, if not then close socket/ kill thread
-    data1 = sock.recv(1000)
-    if len(data1) == 0:
+    data1 = reader.readline()
+    if data1 is None:
         sock.close()
         return
-    
+
     # Strip data for clean username
-    raw_name = data1.decode().split(' ')[0]
+    raw_name = data1.decode(errors='replace').split(' ')[0]
     actual_name = raw_name.replace("\t", " ").replace("\n", "").replace("\r", "")
 
-    # Determine login status
+    # Determine login status. The password prompt below blocks on the network,
+    # so it must happen outside the lock -- otherwise a single client sitting at
+    # the prompt would stall every other thread in the server.
     is_registered = False
     prompt_name = "guest"
 
     with lock:
-        if actual_name in registered_users:
-            mySendAll(sock, "Enter your password: ".encode())
-            data2 = sock.recv(1000)
-            if len(data2) == 0:
-                sock.close()
-                return
-            password = data2.decode().strip()
-            if password != registered_users[actual_name]['password']:
-                mySendAll(sock, b"Login error (username/password do not match)\n")
-                sock.close()
-                return
-            is_registered = True
-            prompt_name = actual_name  # If logged in then use real name
-        else:
-            prompt_name = "guest"
+        known_user = actual_name in registered_users
 
+    if known_user:
+        mySendAll(sock, "Enter your password: ".encode())
+        data2 = reader.readline()
+        if data2 is None:
+            sock.close()
+            return
+        password = data2.decode(errors='replace').strip()
+
+        with lock:
+            expected = registered_users.get(actual_name, {}).get('password')
+        if expected is None or password != expected:
+            mySendAll(sock, b"Login error (username/password do not match)\n")
+            sock.close()
+            return
+
+        is_registered = True
+        prompt_name = actual_name  # If logged in then use real name
+
+    with lock:
         # Prevent duplicate logins (only for registered)
         if is_registered and prompt_name in online_users:
             mySendAll(sock, b"User already online\n")
             sock.close()
             return
+
+        # Anonymous clients each need their own key, or a second guest would
+        # overwrite the first one's entry in online_users.
+        if not is_registered:
+            global next_guest_id
+            prompt_name = "guest" if next_guest_id == 1 else f"guest{next_guest_id}"
+            while prompt_name in online_users:
+                next_guest_id += 1
+                prompt_name = f"guest{next_guest_id}"
+            next_guest_id += 1
+            actual_name = prompt_name
 
         # Create user data
         user_data = {
@@ -510,44 +552,85 @@ def handleOneClient(sock):
     mySendAll(sock, helpMsg.encode())
     mySendAll(sock, f"<{prompt_name}:{cmdCount}> ".encode())
 
-    while True:
-        data = sock.recv(1000)
-        if len(data) == 0:
-            print("Client closed connection")
-            cleanup_user(prompt_name, sock)
-            sock.close()
-            break
-
-        cmd = data.decode().strip()
-        tmp = cmd.split()
-        if tmp:
-            command = tmp[0].lower()
-            if command in ['quit', 'exit']:
-                mySendAll(sock, goodbyeMsg.encode())
-                cleanup_user(prompt_name, sock)
-                sock.close()
+    # A client that vanishes mid-session (terminal closed, network dropped)
+    # raises out of recv/send. Clean up in `finally` either way, so the user
+    # never lingers in online_users as a ghost.
+    try:
+        while True:
+            data = reader.readline()
+            if data is None:
+                print(f"Client closed connection ({prompt_name})")
                 break
-            else:
-                processCmd(prompt_name, sock, cmd)
 
-        # Update and send command prompt
-        cmdCount += 1
-        with lock:
-            if prompt_name in online_users:
-                online_users[prompt_name]['cmd_count'] = cmdCount
-        mySendAll(sock, f"<{prompt_name}:{cmdCount}> ".encode())
+            cmd = data.decode(errors='replace').strip()
+            tmp = cmd.split()
+            if tmp:
+                command = tmp[0].lower()
+                if command in ['quit', 'exit']:
+                    mySendAll(sock, goodbyeMsg.encode())
+                    break
+                else:
+                    processCmd(prompt_name, sock, cmd)
 
-# Main server setup
-s = socket()
-h = gethostname()
-print(sys.argv[0], sys.argv[1])
+            # Update and send command prompt
+            cmdCount += 1
+            with lock:
+                if prompt_name in online_users:
+                    online_users[prompt_name]['cmd_count'] = cmdCount
+            mySendAll(sock, f"<{prompt_name}:{cmdCount}> ".encode())
+    except OSError as e:
+        print(f"Connection error for {prompt_name}: {e}")
+    finally:
+        cleanup_user(prompt_name, sock)
+        sock.close()
 
-s.bind((h, int(sys.argv[1])))
-s.listen(5)
-        
-# Infinite loop to accept new clients
-while True:
-    sock, addr = s.accept()
-    print("Receive client connection from ", addr)
-    p = threading.Thread(target=handleOneClient, args=(sock,), daemon=True)
-    p.start()
+# ------------------------------------------------ Server startup ---------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Multi-threaded TCP chat server.",
+        epilog="Connect with: python3 client.py  (or: telnet 127.0.0.1 %d)" % DEFAULT_PORT,
+    )
+    parser.add_argument('--host', default=os.environ.get('CHAT_HOST', DEFAULT_HOST),
+                        help="interface to bind (default: %(default)s; use 0.0.0.0 to accept "
+                             "connections from other machines)")
+    parser.add_argument('--port', type=int, default=int(os.environ.get('CHAT_PORT', DEFAULT_PORT)),
+                        help="port to listen on (default: %(default)s)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    loadMsgs()
+    load_users()
+
+    s = socket(AF_INET, SOCK_STREAM)
+    # Without SO_REUSEADDR a restart inside the TCP TIME_WAIT window fails with
+    # "Address already in use", which makes the server annoying to iterate on.
+    s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+
+    try:
+        s.bind((args.host, args.port))
+    except OSError as e:
+        raise SystemExit(f"Cannot bind {args.host}:{args.port} -- {e}")
+    s.listen(5)
+
+    print(f"Internet Chat Server listening on {args.host}:{args.port}")
+    print(f"Connect with:  python3 client.py --host {args.host} --port {args.port}")
+    print("Press Ctrl-C to stop.")
+
+    # Infinite loop to accept new clients
+    try:
+        while True:
+            sock, addr = s.accept()
+            print("Receive client connection from ", addr)
+            p = threading.Thread(target=handleOneClient, args=(sock,), daemon=True)
+            p.start()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+    finally:
+        s.close()
+
+
+if __name__ == "__main__":
+    main()
