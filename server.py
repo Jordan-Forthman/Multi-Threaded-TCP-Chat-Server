@@ -11,9 +11,12 @@ client: `python3 client.py`.
 
 from socket import *
 import argparse
-import threading
+import hashlib
+import hmac
 import json
 import os
+import secrets
+import threading
 
 # Resolve data files relative to this file so the server can be started from
 # any working directory.
@@ -79,6 +82,51 @@ online_users = {}      # Dictionary to store currently online users' data (socke
 rooms = {}             # Dictionary to store active chat rooms (topic, leader, members)
 next_room_id = 0       # Counter for generating unique room IDs
 next_guest_id = 1      # Counter for generating unique handles for anonymous clients
+
+# ------------------------------------------- Password hashing -------------------------------------------------
+
+# Stored form: "scrypt$<n>$<r>$<p>$<salt_hex>$<hash_hex>". Embedding the
+# parameters means the cost can be raised later without invalidating hashes
+# that were written under the old settings.
+SCRYPT_N = 2 ** 14   # CPU/memory cost; 16384 needs ~16 MiB per hash
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+
+
+def hash_password(password, salt=None, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P):
+    """Derive a salted scrypt hash, encoded together with its parameters."""
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, dklen=SCRYPT_DKLEN)
+    return f"scrypt${n}${r}${p}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password, stored):
+    """Check `password` against a stored credential.
+
+    Returns (ok, upgraded). `upgraded` is a replacement hash the caller should
+    persist, or None. Accounts written before hashing existed hold a plaintext
+    password: those verify once and are rewritten as a hash, so an existing
+    users.json keeps working without anyone re-registering.
+    """
+    if not stored.startswith("scrypt$"):
+        if hmac.compare_digest(password, stored):
+            return True, hash_password(password)
+        return False, None
+
+    try:
+        _, n, r, p, salt_hex, hash_hex = stored.split("$")
+        candidate = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
+                                   n=int(n), r=int(r), p=int(p),
+                                   dklen=len(hash_hex) // 2)
+    except ValueError:
+        # Malformed record: fail closed rather than letting anyone in.
+        return False, None
+
+    # Constant-time compare, so a wrong guess cannot be narrowed down by timing.
+    return hmac.compare_digest(candidate.hex(), hash_hex), None
+
 
 # -------------------------------------------Persistence functions---------------------------------------------
 
@@ -456,7 +504,13 @@ def processCmd(userName, sock, cmd):
             if u in registered_users:
                 mySendAll(sock, b"User already exists\n")
                 return 0
-            registered_users[u] = {'password': p, 'info': '', 'blocked': set()}
+        # Hashing is slow by design; do it before taking the lock back.
+        hashed = hash_password(p)
+        with lock:
+            if u in registered_users:  # re-check: another thread may have won
+                mySendAll(sock, b"User already exists\n")
+                return 0
+            registered_users[u] = {'password': hashed, 'info': '', 'blocked': set()}
             save_users()
         mySendAll(sock, f"User {u} registered\n".encode())
     else:
@@ -502,11 +556,21 @@ def handleOneClient(sock):
         password = data2.decode(errors='replace').strip()
 
         with lock:
-            expected = registered_users.get(actual_name, {}).get('password')
-        if expected is None or password != expected:
+            stored = registered_users.get(actual_name, {}).get('password')
+        # Deriving the hash is deliberately slow, so keep it outside the lock.
+        ok, upgraded = verify_password(password, stored) if stored else (False, None)
+        if not ok:
             mySendAll(sock, b"Login error (username/password do not match)\n")
             sock.close()
             return
+
+        if upgraded:
+            # Migrating a legacy plaintext record now that we know it is valid.
+            with lock:
+                if actual_name in registered_users:
+                    registered_users[actual_name]['password'] = upgraded
+            save_users()
+            print(f"Upgraded stored password for {actual_name} to scrypt")
 
         is_registered = True
         prompt_name = actual_name  # If logged in then use real name
